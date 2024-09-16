@@ -190,7 +190,8 @@ class EEX:
                 while time < endTime:
                     info.append(
                         {'time': time,
-                         'price': day['price']}
+                         'price': day['price']
+                         }
                     )
                     time += timedelta(hours=1)
             # Remove out-of-bounds data
@@ -285,7 +286,7 @@ class EEX:
                     time += timedelta(days=1)  # Day ahead
                     mappedDay = {
                         'time': time,
-                        'price': round(float(day['close']), 2),
+                        'price': day['close'],
                         'descr': self.tmpZone,
                     }
 
@@ -303,7 +304,7 @@ class EEX:
                         satTime += timedelta(days=1)
                         sat = {
                             'time': satTime,
-                            'price': round(float(weekend['close']), 2),
+                            'price': weekend['close'],
                             'descr': self.tmpZone,
                         }
                         sun = sat.copy()
@@ -331,11 +332,12 @@ def main():
     today_saved = copy.deepcopy(today)
     look_back_window_days = 20
 
-    for biddingZone in ['TTF_EGSI', 'TTF_EOD']:
+    for biddingZone in ['TTF_EOD','TTF_EGSI']:
 
         df_ = pd.DataFrame()
 
         eex = EEX(dict(biddingZone = biddingZone))
+        n = 0
         while today > (today_saved - timedelta(days=look_back_window_days)):
 
             yesterday = today - timedelta(days=3)
@@ -347,10 +349,13 @@ def main():
                 df_i = pd.DataFrame(result)
                 df_ = pd.concat([df_, df_i])
                 today -= timedelta(days=3)
-
             except Exception as e:
                 print(f"Failed with {e}")
                 break
+            n+=1
+
+        print(f"Successfully collected data for {biddingZone} N={n} times")
+
         today = today_saved
 
         df_.sort_values(by='time', ascending=True, inplace=True)

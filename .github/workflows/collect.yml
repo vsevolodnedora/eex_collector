@@ -25,7 +25,11 @@ jobs:
           git config --global user.name 'Collect Bot'
           git config --global user.email 'noreply@nedora.digital'
           git add .
-          git commit -m "Add data for today"
-          git pull -r
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to commit.";
+          else
+            git commit -m "Add data"
+            git pull --rebase
+            git push
+          fi
 
