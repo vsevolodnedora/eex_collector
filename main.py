@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import pytz
 import pandas as pd
 import copy
+import time
 
 import requests
 import urllib3
@@ -324,42 +325,49 @@ class EEX:
             raise error
 
 
-def main():
-    res = {}
+def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
 
     today = datetime.now()
     today = today.replace(hour=0, minute=0, second=0, microsecond=0)
     today_saved = copy.deepcopy(today)
-    look_back_window_days = 20
+
+    df_ = pd.DataFrame()
+
+    eex = EEX(dict(biddingZone = biddingZone))
+    n = 0
+    while today > (today_saved - timedelta(days=look_back_window_days)):
+
+        yesterday = today - timedelta(days=3)
+        tomorrow = today + timedelta(days=2)
+
+        try:
+            print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
+            result = eex.getPrices({'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()})
+            df_i = pd.DataFrame(result)
+            df_ = pd.concat([df_, df_i])
+            today -= timedelta(days=3)
+        except Exception as e:
+            print(f"Failed with {e}")
+            break
+        n+=1
+
+    print(f"Successfully collected data for {biddingZone} N={n} times")
+
+    df_.sort_values(by='time', ascending=True, inplace=True)
+    df_.drop_duplicates(inplace=True)
+    return df_
+def main():
+    res = {}
 
     for biddingZone in ['TTF_EOD','TTF_EGSI']:
 
-        df_ = pd.DataFrame()
-
-        eex = EEX(dict(biddingZone = biddingZone))
-        n = 0
-        while today > (today_saved - timedelta(days=look_back_window_days)):
-
-            yesterday = today - timedelta(days=3)
-            tomorrow = today + timedelta(days=2)
-
-            try:
-                print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
-                result = eex.getPrices({'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()})
-                df_i = pd.DataFrame(result)
-                df_ = pd.concat([df_, df_i])
-                today -= timedelta(days=3)
-            except Exception as e:
-                print(f"Failed with {e}")
-                break
-            n+=1
-
-        print(f"Successfully collected data for {biddingZone} N={n} times")
-
-        today = today_saved
-
-        df_.sort_values(by='time', ascending=True, inplace=True)
-        df_.drop_duplicates(inplace=True)
+        df_ = fetch_data_for_zone(biddingZone)
+        if df_.empty:
+            print(f'Error. Failed to fetch ANY data for zone = {biddingZone}. Trying again...')
+            time.sleep(25)
+            df_ = fetch_data_for_zone(biddingZone)
+            if df_.empty:
+                raise IOError("Error. Repeatedly failed to fetch ANY data for zone = {biddingZone}.")
 
         res[biddingZone] = copy.deepcopy(df_)
 
