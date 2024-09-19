@@ -348,7 +348,7 @@ def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
             today -= timedelta(days=3)
         except Exception as e:
             print(f"Failed with {e}")
-            break
+            continue
         n+=1
 
     print(f"Successfully collected data for {biddingZone} N={n} times")
