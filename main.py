@@ -147,7 +147,8 @@ class EEX:
             path = f'/query/json/getDaily/close/tradedatetimegmt/?{query}'
 
             # Making the API request
-            res = self._makeRequest(path, '')
+            print(f"\tRequest: {path}")
+            res = self._makeRequest(path, 90*1000)
 
             # Processing the response
             if not res or not res[0] or not res[0].get('time'):
@@ -337,15 +338,17 @@ def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
     n = 0
     while today > (today_saved - timedelta(days=look_back_window_days)):
 
-        yesterday = today - timedelta(days=3)
+        yesterday = today - timedelta(days=2)
         tomorrow = today + timedelta(days=2)
 
         try:
             print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
-            result = eex.getPrices({'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()})
+            result = eex.getPrices(
+                {'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()}
+            )
             df_i = pd.DataFrame(result)
             df_ = pd.concat([df_, df_i])
-            today -= timedelta(days=3)
+            today -= timedelta(days=2)
         except Exception as e:
             print(f"Failed with {e}")
             continue
@@ -356,6 +359,7 @@ def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
     df_.sort_values(by='time', ascending=True, inplace=True)
     df_.drop_duplicates(inplace=True)
     return df_
+
 def main():
     res = {}
 
@@ -364,10 +368,10 @@ def main():
         df_ = fetch_data_for_zone(biddingZone)
         if df_.empty:
             print(f'Error. Failed to fetch ANY data for zone = {biddingZone}. Trying again...')
-            time.sleep(25)
+            time.sleep(60)
             df_ = fetch_data_for_zone(biddingZone)
             if df_.empty:
-                raise IOError("Error. Repeatedly failed to fetch ANY data for zone = {biddingZone}.")
+                raise IOError(f"Error. Repeatedly failed to fetch ANY data for zone = {biddingZone}.")
 
         res[biddingZone] = copy.deepcopy(df_)
 
