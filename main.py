@@ -117,90 +117,92 @@ class EEX:
             Price: The settlement or spot price of natural gas, adjusted to euro per 1,000 cubic meters
             (the code multiplies by 9.7694 to convert the unit).
         """
-        try:
-            # Date setup
-            today = datetime.utcnow()
-            tomorrow = today + timedelta(days=1)
 
-            # Parsing options
-            opts = options or {}
-            zone = opts.get('biddingZone', self.biddingZone)
-            start = datetime.fromisoformat(opts.get('dateStart')) if opts.get('dateStart') else today
-            end = datetime.fromisoformat(opts.get('dateEnd')) if opts.get('dateEnd') else tomorrow
+        # Date setup
+        today = datetime.utcnow()
+        tomorrow = today + timedelta(days=1)
 
-            # Adjusting times
-            start = start.replace(minute=0, second=0, microsecond=0)
-            end = end.replace(minute=0, second=0, microsecond=0)
+        # Parsing options
+        opts = options or {}
+        zone = opts.get('biddingZone', self.biddingZone)
+        start = datetime.fromisoformat(opts.get('dateStart')) if opts.get('dateStart') else today
+        end = datetime.fromisoformat(opts.get('dateEnd')) if opts.get('dateEnd') else tomorrow
 
-            # Preparing query parameters
-            self.tmpZone = zone
-            start2 = start - timedelta(days=1)  # start earlier to make sure weekend is fetched
-            chartstartdate = start2.isoformat().split('T')[0]  # 'YYYY-MM-DD'
-            chartstopdate = end.isoformat().split('T')[0]  # 'YYYY-MM-DD'
-            priceSymbol = biddingZonesMap.get(zone)  # e.g., "#E.TTF_GND1"
+        # Adjusting times
+        start = start.replace(minute=0, second=0, microsecond=0)
+        end = end.replace(minute=0, second=0, microsecond=0)
 
-            query = urllib.parse.urlencode({
-                'priceSymbol': priceSymbol,
-                'chartstartdate': chartstartdate,
-                'chartstopdate': chartstopdate,
-            })
-            path = f'/query/json/getDaily/close/tradedatetimegmt/?{query}'
+        # Preparing query parameters
+        self.tmpZone = zone
+        start2 = start - timedelta(days=1)  # start earlier to make sure weekend is fetched
+        chartstartdate = start2.isoformat().split('T')[0]  # 'YYYY-MM-DD'
+        chartstopdate = end.isoformat().split('T')[0]  # 'YYYY-MM-DD'
+        priceSymbol = biddingZonesMap.get(zone)  # e.g., "#E.TTF_GND1"
 
-            # Making the API request
-            print(f"\tRequest: {path}")
-            res = self._makeRequest(path, 90*1000)
+        query = urllib.parse.urlencode({
+            'priceSymbol': priceSymbol,
+            'chartstartdate': chartstartdate,
+            'chartstopdate': chartstopdate,
+        })
+        path = f'/query/json/getDaily/close/tradedatetimegmt/?{query}'
 
-            # Processing the response
-            if not res or not res[0] or not res[0].get('time'):
-                raise Exception('No gas price info found')
+        # Making the API request
+        print(f"\tRequest: {path}")
+        res = self._makeRequest(path, 90*1000)
 
-            # Extracting and adjusting price information; Make array with concise info per day in euro / 1000 m3 gas
-            priceInfo = []
-            for day in res:
-                if day['descr'] == zone:
-                    # Time adjustments
-                    dayStart = day['time'].replace(hour=0, minute=0, second=0, microsecond=0)
-                    timezone = pytz.timezone('Europe/Berlin')
-                    dayStartLocalized = timezone.localize(dayStart)
-                    timeZoneOffset = dayStartLocalized.utcoffset().total_seconds() * 1000
-                    dayStart -= timedelta(milliseconds=timeZoneOffset)
-                    tariffStart = dayStart + timedelta(hours=6)
+        # Processing the response
+        if not res or not res[0] or not res[0].get('time'):
+            raise Exception('No gas price info found')
 
-                    # Collecting price information
-                    ''' 
-                    https://beyondfossilfuels.org/wp-content/uploads/2023/03/BFF-FreedomFromFossilFuels-2023-LowRes-2.pdf
-                    Base units for our report are billion cubic metres (bcm) for fossil gas and million tonnes
-                    (Mt) for hard coal. For coherence with other similar reports, we have applied uniform
-                    conversion factors for both commodities: 9.7694 TWh/bcm for fossil gas and 8.141 TWh/
-                    Mt for hard coal. 
-                    '''
-                    priceInfo.append({
-                        'tariffStart': tariffStart,
-                        'price': day['price'] * 9.7694,
-                        'descr': day['descr'],
-                    })
+        # Extracting and adjusting price information; Make array with concise info per day in euro / 1000 m3 gas
+        priceInfo = []
+        for day in res:
+            if day['descr'] == zone:
+                # Time adjustments
+                dayStart = day['time'].replace(hour=0, minute=0, second=0, microsecond=0)
+                timezone = pytz.timezone('Europe/Berlin')
+                dayStartLocalized = timezone.localize(dayStart)
+                timeZoneOffset = dayStartLocalized.utcoffset().total_seconds() * 1000
+                dayStart -= timedelta(milliseconds=timeZoneOffset)
+                tariffStart = dayStart + timedelta(hours=6)
 
-            # Filtering and adjusting the data
-            priceInfo = [day for day in priceInfo if day['tariffStart'] >= (start - timedelta(days=1))]
 
-            # Pad info to fill all hours in a day -- Filling all hours in a day
-            info = []
-            for day in priceInfo:
-                startTime = day['tariffStart']
-                endTime = startTime + timedelta(days=1)
-                time = startTime
-                while time < endTime:
-                    info.append(
-                        {'time': time,
-                         'price': day['price']
-                         }
-                    )
-                    time += timedelta(hours=1)
-            # Remove out-of-bounds data
-            info = [hourInfo for hourInfo in info if start <= hourInfo['time'] < end]
-            return info
-        except Exception as error:
-            raise error
+                if day['price'] is None:
+                    print(f"WARNING: No gas price info found for options={options}")
+                # Collecting price information
+                ''' 
+                https://beyondfossilfuels.org/wp-content/uploads/2023/03/BFF-FreedomFromFossilFuels-2023-LowRes-2.pdf
+                Base units for our report are billion cubic metres (bcm) for fossil gas and million tonnes
+                (Mt) for hard coal. For coherence with other similar reports, we have applied uniform
+                conversion factors for both commodities: 9.7694 TWh/bcm for fossil gas and 8.141 TWh/
+                Mt for hard coal. 
+                '''
+                priceInfo.append({
+                    'tariffStart': tariffStart,
+                    'price': float(day['price'] if not day['price'] is None else 0) * 9.7694,
+                    'descr': day['descr'] if not day['descr'] is None else "None",
+                })
+
+        # Filtering and adjusting the data
+        priceInfo = [day for day in priceInfo if day['tariffStart'] >= (start - timedelta(days=1))]
+
+        # Pad info to fill all hours in a day -- Filling all hours in a day
+        info = []
+        for day in priceInfo:
+            startTime = day['tariffStart']
+            endTime = startTime + timedelta(days=1)
+            time = startTime
+            while time < endTime:
+                info.append(
+                    {'time': time,
+                     'price': day['price']
+                     }
+                )
+                time += timedelta(hours=1)
+        # Remove out-of-bounds data
+        info = [hourInfo for hourInfo in info if start <= hourInfo['time'] < end]
+        return info
+
 
     def _makeRequest(self, path, timeout=None):
         try:
@@ -341,17 +343,14 @@ def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
         yesterday = today - timedelta(days=2)
         tomorrow = today + timedelta(days=2)
 
-        try:
-            print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
-            result = eex.getPrices(
-                {'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()}
-            )
-            df_i = pd.DataFrame(result)
-            df_ = pd.concat([df_, df_i])
-            today -= timedelta(days=2)
-        except Exception as e:
-            print(f"Failed with {e}")
-            continue
+        print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
+        result = eex.getPrices(
+            {'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()}
+        )
+        df_i = pd.DataFrame(result)
+        df_ = pd.concat([df_, df_i])
+        today -= timedelta(days=2)
+
         n+=1
 
     print(f"Successfully collected data for {biddingZone} N={n} times")
