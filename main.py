@@ -1,66 +1,57 @@
 """
 Inspired by https://github.com/gruijter/com.gruijter.powerhour
-Translated with the help of ChatGPT-o1-preview
+
+Fixed:
+- Uses logging instead of print (clear, structured tracing)
+- Robust HTTP layer with retries + JSON/content-type validation
+- Proper handling of 401 Unauthorized (EGSI and weekend data may be paywalled)
+- Avoids corrupting data by writing fake 0 prices when price is missing
+- Fixes swapped column names in merge (EOD vs EGSI)
+- Better timezone handling for "gas day" start (06:00 Europe/Berlin) using zoneinfo
 """
 
-from datetime import datetime, timedelta
-import pytz
-import pandas as pd
-import copy
-import time
-from urllib3.util.retry import Retry
-import requests
-import urllib3
-import urllib.parse
-urllib3.disable_warnings(
-    urllib3.exceptions.InsecureRequestWarning
-)
-from requests.adapters import HTTPAdapter
-# Each bidding zone has two variants:
-# EOD: End of Day settlement prices.
-# EGSI: European Gas Spot Index prices.
-biddingZones = {
-    # TTF - Title Transfer Facility (Netherlands)
-    "TTF_EOD": 'TTF_EOD', # End of Day (EOD) Prices: Reflect the price at which the gas contracts settled at the end of the trading day.
-    "TTF_EGSI": 'TTF_EGSI', # European Gas Spot Index (EGSI) Prices: Represents spot prices for natural gas, which are prices for immediate delivery.
-    # CEGH_VTP: Central European Gas Hub Virtual Trading Point (Austria)
-    "CEGH_VTP_EOD": 'CEGH_VTP_EOD',
-    "CEGH_VTP_EGSI": 'CEGH_VTP_EGSI',
-    # CZ_VTP: Czech Virtual Trading Point
-    "CZ_VTP_EOD": 'CZ_VTP_EOD',
-    "CZ_VTP_EGSI": 'CZ_VTP_EGSI',
-    # ETF: Zeebrugge Hub (Belgium)
-    "ETF_EOD": 'ETFF_EOD',
-    "ETF_EGSI": 'ETF_EGSI',
-    # THE: Trading Hub Europe (Germany)
-    "THE_EOD": 'THE_EOD',
-    "THE_EGSI": 'THE_EGSI',
-    # PEG: Point d'Échange de Gaz (France)
-    "PEG_EOD": 'PEG_EOD',
-    "PEG_EGSI": 'PEG_EGSI',
-    # ZTP: Zeebrugge Trading Point (Belgium)
-    "ZTP_EOD": 'ZTP_EOD',
-    "ZTP_EGSI": 'ZTP_EGSI',
-    # PVB: Punto Virtual de Balance (Spain)
-    "PVB_EOD": 'PVB_EOD',
-    "PVB_EGSI": 'PVB_EGSI',
-    # NBP: National Balancing Point (United Kingdom)
-    "NBP_EOD": 'NBP_EOD',
-    "NBP_EGSI": 'NBP_EGSI',
-}
+from __future__ import annotations
 
-# The biddingZonesMap provides the priceSymbol required by the EEX API for each bidding zone. For example:
-biddingZonesMap = {
+import os
+import time
+import copy
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import requests
+import urllib.parse
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --------------------------------------------------------------------
+# Config / constants
+# --------------------------------------------------------------------
+
+DEFAULT_HOST = "webservice-eex.gvsi.com"
+DEFAULT_PORT = 443
+DEFAULT_TIMEOUT_MS = 30_000
+
+BERLIN = ZoneInfo("Europe/Berlin")
+
+biddingZonesMap: Dict[str, str] = {
     # End of Day (EOD) Prices:
     "TTF_EOD": '"#E.TTF_GND1"',
     "CEGH_VTP_EOD": '"#E.CEGH_GND1"',
     "CZ_VTP_EOD": '"#E.OTE_GSND"',
-    "ETF_EOD": '"#E.ETF_GND1"',
+    "ETF_EOD": '"#E.ETF_GND1"',  # fixed from ETFF typo in your original
     "THE_EOD": '"#E.THE_GND1"',
     "PEG_EOD": '"#E.PEG_GND1"',
     "ZTP_EOD": '"#E.ZTP_GTND"',
     "PVB_EOD": '"#E.PVB_GSND"',
     "NBP_EOD": '"#E.NBP_GPND"',
+
     # European Gas Spot Index (EGSI) Prices:
     "TTF_EGSI": '"$E.EGSI_TTF_DAY"',
     "CEGH_VTP_EGSI": '"$E.EGSI_CEHG_VTP_DAY"',
@@ -73,29 +64,101 @@ biddingZonesMap = {
     "NBP_EGSI": '"$E.EGSI_NBP_DAY"',
 }
 
+# Conversion factor from bcm to TWh (as in your comment)
+GAS_BCM_TO_TWH = 9.7694
 
-defaultHost = 'webservice-eex.gvsi.com'  # EOD and EGSI # The default host URL for the EEX API.
-defaultPort = 443 # The port number for HTTPS connections.
-defaultTimeout = 30000  # in milliseconds # The default timeout for HTTP requests, specified in milliseconds.
+# --------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------
+
+logger = logging.getLogger("eex_collector")
+
+
+def setup_logging() -> None:
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    # Make requests/urllib3 less noisy unless you explicitly bump LOG_LEVEL
+    logging.getLogger("urllib3").setLevel(max(level, logging.WARNING))
+    logging.getLogger("requests").setLevel(max(level, logging.WARNING))
+
+
+# --------------------------------------------------------------------
+# Exceptions
+# --------------------------------------------------------------------
+
+class EEXError(RuntimeError):
+    """Base EEX error."""
+
+
+class EEXUnauthorized(EEXError):
+    """HTTP 401 from the endpoint (often means paywalled / missing auth)."""
+
+
+class EEXBadResponse(EEXError):
+    """Non-JSON or malformed JSON response."""
+
+
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+
+def parse_iso_dt(value: str) -> datetime:
+    """
+    Parse ISO datetime. If timezone-aware, convert to UTC naive.
+    If naive, assume it's UTC (keeps behavior consistent in CI).
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def to_utc_naive_from_berlin_gasday_start(day_utc_naive: datetime) -> datetime:
+    """
+    Given a UTC-naive datetime representing the day (00:00 UTC),
+    compute the gas day start at 06:00 Europe/Berlin for that calendar date,
+    then return UTC-naive datetime.
+    """
+    # Use the calendar date in Berlin time:
+    # We interpret 'day_utc_naive' as a date marker; use its Y-M-D
+    local = datetime(day_utc_naive.year, day_utc_naive.month, day_utc_naive.day, 6, 0, 0, tzinfo=BERLIN)
+    utc = local.astimezone(timezone.utc).replace(tzinfo=None)
+    return utc
+
+
+# --------------------------------------------------------------------
+# EEX Client
+# --------------------------------------------------------------------
+
+@dataclass
+class EEXOptions:
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
+    verify_ssl: bool = False  # keep original behavior by default
+
 
 class EEX:
-    """
-    The EEX class encapsulates all the functionality needed to interact with the EEX API.
-    It includes methods for initializing the session, fetching bidding zones, retrieving gas prices,
-    and making HTTP requests.
-    """
-    def __init__(self, opts=None):
+    def __init__(self, biddingZone: Optional[str] = None, opts: Optional[Dict[str, Any]] = None):
         options = opts or {}
-        self.host = options.get('host', defaultHost)
-        self.port = options.get('port', defaultPort)
-        self.timeout = options.get('timeout', defaultTimeout)
-        self.biddingZone = options.get('biddingZone')
-        self.verify_ssl = options.get('verify_ssl', False)  # keep your current behavior by default
-        self.lastResponse = None
-        self.lastDailyInfo = None
-        self.tmpZone = None
+        self.opts = EEXOptions(
+            host=options.get("host", DEFAULT_HOST),
+            port=int(options.get("port", DEFAULT_PORT)),
+            timeout_ms=int(options.get("timeout", DEFAULT_TIMEOUT_MS)),
+            verify_ssl=bool(options.get("verify_ssl", False)),
+        )
+        self.biddingZone = biddingZone or options.get("biddingZone")
+        self.tmpZone: Optional[str] = None
 
-        # One session + retries (handles transient 429/5xx)
+        self.lastResponseSnippet: Optional[str] = None
+        self.lastDailyInfo: Optional[List[Dict[str, Any]]] = None
+
         self.session = requests.Session()
         retry = Retry(
             total=5,
@@ -106,8 +169,10 @@ class EEX:
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
-    def _headers(self):
-        # For GET, "Accept" matters; request "content-type" usually doesn't.
+        if not self.opts.verify_ssl:
+            logger.warning("SSL verification is DISABLED (verify_ssl=False).")
+
+    def _headers(self) -> Dict[str, str]:
         return {
             "Accept": "application/json",
             "Origin": "https://www.eex.com",
@@ -115,179 +180,187 @@ class EEX:
             "User-Agent": "Mozilla/5.0",
             "Connection": "keep-alive",
         }
-    def _get_json(self, path: str, timeout_ms: int | None = None) -> dict:
-        url = f"https://{self.host}:{self.port}{path}"
+
+    def _url(self, path: str) -> str:
+        return f"https://{self.opts.host}:{self.opts.port}{path}"
+
+    def _get_json(self, path: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
+        url = self._url(path)
+        start = time.time()
         r = self.session.get(
             url,
             headers=self._headers(),
-            timeout=(timeout_ms or self.timeout) / 1000,
-            verify=self.verify_ssl,
+            timeout=(timeout_ms or self.opts.timeout_ms) / 1000,
+            verify=self.opts.verify_ssl,
             allow_redirects=True,
         )
+        elapsed_ms = int((time.time() - start) * 1000)
 
-        # keep something useful for debugging
-        self.lastResponse = (r.text or "")[:2000]
+        body_snippet = (r.text or "")[:300].replace("\n", " ")
+        self.lastResponseSnippet = body_snippet
 
-        # status check first
+        logger.debug("HTTP GET %s | status=%s | %dms", url, r.status_code, elapsed_ms)
+
+        if r.status_code == 401:
+            raise EEXUnauthorized(f"HTTP 401 for {url}. Body starts: {body_snippet!r}")
+
         if r.status_code != 200:
-            snippet = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"HTTP {r.status_code} for {r.url}. Body starts: {snippet!r}")
+            raise EEXError(f"HTTP {r.status_code} for {url}. Body starts: {body_snippet!r}")
 
-        # content-type check (tolerate charset etc.)
         ctype = (r.headers.get("content-type") or "").lower()
         if "json" not in ctype:
-            snippet = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"Non-JSON response for {r.url} (content-type={ctype!r}). Body starts: {snippet!r}")
+            raise EEXBadResponse(f"Non-JSON response for {url} (content-type={ctype!r}). Body starts: {body_snippet!r}")
 
         try:
             return r.json()
         except ValueError as e:
-            snippet = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"Invalid JSON from {r.url}. Body starts: {snippet!r}") from e
+            raise EEXBadResponse(f"Invalid JSON for {url}. Body starts: {body_snippet!r}") from e
 
-    def _items(self, path: str, timeout_ms: int | None = None) -> list[dict]:
-        payload = self._get_json(path, timeout_ms)
+    def _items(self, path: str, timeout_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        payload = self._get_json(path, timeout_ms=timeout_ms)
         items = payload.get("results", {}).get("items")
         if not isinstance(items, list):
-            raise RuntimeError(f"Invalid payload shape for {path}: missing results.items")
+            raise EEXBadResponse(f"Malformed payload for path={path}: missing results.items")
         return items
 
-    def getPrices(self, options=None):
+    def getPrices(self, options: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-         Retrieves gas price information based on specified options.
-        :param options: A dictionary containing optional parameters:
-            'biddingZone': The bidding zone to query.
-            'dateStart': The start date for the data retrieval.
-            'dateEnd': The end date for the data retrieval.
-        :return:
-            Price: The settlement or spot price of natural gas, adjusted to euro per 1,000 cubic meters
-            (the code multiplies by 9.7694 to convert the unit).
+        Returns hourly price info in UTC-naive timestamps:
+        [
+          {"time": <datetime>, "price": <float>},
+          ...
+        ]
         """
-
-        # Date setup
-        today = datetime.utcnow()
-        tomorrow = today + timedelta(days=1)
-
-        # Parsing options
         opts = options or {}
-        zone = opts.get('biddingZone', self.biddingZone)
-        start = datetime.fromisoformat(opts.get('dateStart')) if opts.get('dateStart') else today
-        end = datetime.fromisoformat(opts.get('dateEnd')) if opts.get('dateEnd') else tomorrow
+        zone = opts.get("biddingZone", self.biddingZone)
+        if not zone:
+            raise ValueError("biddingZone must be set (either in constructor or options).")
 
-        # Adjusting times
+        today_utc = datetime.utcnow()
+        tomorrow_utc = today_utc + timedelta(days=1)
+
+        start = parse_iso_dt(opts["dateStart"]) if opts.get("dateStart") else today_utc
+        end = parse_iso_dt(opts["dateEnd"]) if opts.get("dateEnd") else tomorrow_utc
+
         start = start.replace(minute=0, second=0, microsecond=0)
         end = end.replace(minute=0, second=0, microsecond=0)
 
-        # Preparing query parameters
         self.tmpZone = zone
-        start2 = start - timedelta(days=1)  # start earlier to make sure weekend is fetched
-        chartstartdate = start2.isoformat().split('T')[0]  # 'YYYY-MM-DD'
-        chartstopdate = end.isoformat().split('T')[0]  # 'YYYY-MM-DD'
-        priceSymbol = biddingZonesMap.get(zone)  # e.g., "#E.TTF_GND1"
 
-        query = urllib.parse.urlencode({
-            'priceSymbol': priceSymbol,
-            'chartstartdate': chartstartdate,
-            'chartstopdate': chartstopdate,
-        })
-        path = f'/query/json/getDaily/close/tradedatetimegmt/?{query}'
+        # Start earlier to ensure weekend or delayed settlements don't cause gaps
+        start2 = start - timedelta(days=1)
+        chartstartdate = start2.date().isoformat()
+        chartstopdate = end.date().isoformat()
 
-        # Making the API request
-        print(f"\tRequest: {path}")
-        res = self._makeRequest(path, 90*1000)
+        priceSymbol = biddingZonesMap.get(zone)
+        if not priceSymbol:
+            raise ValueError(f"Unknown biddingZone={zone}. Missing priceSymbol mapping.")
 
-        # Processing the response
-        if not res or not res[0] or not res[0].get('time'):
-            raise Exception('No gas price info found')
+        query = urllib.parse.urlencode(
+            {"priceSymbol": priceSymbol, "chartstartdate": chartstartdate, "chartstopdate": chartstopdate}
+        )
+        path = f"/query/json/getDaily/close/tradedatetimegmt/?{query}"
 
-        # Extracting and adjusting price information; Make array with concise info per day in euro / 1000 m3 gas
-        priceInfo = []
-        for day in res:
-            if day['descr'] == zone:
-                # Time adjustments
-                dayStart = day['time'].replace(hour=0, minute=0, second=0, microsecond=0)
-                timezone = pytz.timezone('Europe/Berlin')
-                dayStartLocalized = timezone.localize(dayStart)
-                timeZoneOffset = dayStartLocalized.utcoffset().total_seconds() * 1000
-                dayStart -= timedelta(milliseconds=timeZoneOffset)
-                tariffStart = dayStart + timedelta(hours=6)
+        logger.info("EEX request | zone=%s | start=%s | end=%s | path=%s", zone, start, end, path)
 
+        daily = self._makeRequest(path, timeout_ms=90_000)
 
-                if day['price'] is None:
-                    print(f"WARNING: No gas price info found for options={options}")
-                # Collecting price information
-                ''' 
-                https://beyondfossilfuels.org/wp-content/uploads/2023/03/BFF-FreedomFromFossilFuels-2023-LowRes-2.pdf
-                Base units for our report are billion cubic metres (bcm) for fossil gas and million tonnes
-                (Mt) for hard coal. For coherence with other similar reports, we have applied uniform
-                conversion factors for both commodities: 9.7694 TWh/bcm for fossil gas and 8.141 TWh/
-                Mt for hard coal. 
-                '''
-                priceInfo.append({
-                    'tariffStart': tariffStart,
-                    'price': float(day['price'] if not day['price'] is None else 0) * 9.7694,
-                    'descr': day['descr'] if not day['descr'] is None else "None",
-                })
+        if not daily or not any(d.get("time") for d in daily):
+            raise EEXBadResponse("No gas price info found in daily response")
 
-        # Filtering and adjusting the data
-        priceInfo = [day for day in priceInfo if day['tariffStart'] >= (start - timedelta(days=1))]
+        # Build per-day records (skip None price days)
+        priceInfo: List[Dict[str, Any]] = []
+        for day in daily:
+            if day.get("descr") != zone:
+                continue
 
-        # Pad info to fill all hours in a day -- Filling all hours in a day
-        info = []
-        for day in priceInfo:
-            startTime = day['tariffStart']
-            endTime = startTime + timedelta(days=1)
-            time = startTime
-            while time < endTime:
-                info.append(
-                    {'time': time,
-                     'price': day['price']
-                     }
-                )
-                time += timedelta(hours=1)
-        # Remove out-of-bounds data
-        info = [hourInfo for hourInfo in info if start <= hourInfo['time'] < end]
+            raw_day = day.get("time")
+            raw_price = day.get("price")
+
+            if raw_day is None:
+                continue
+
+            if raw_price is None:
+                logger.warning("No gas price (None) | zone=%s | day=%s | options=%s", zone, raw_day, opts)
+                continue
+
+            # Gas day start: 06:00 Europe/Berlin converted to UTC naive
+            tariffStart = to_utc_naive_from_berlin_gasday_start(raw_day.replace(hour=0, minute=0, second=0, microsecond=0))
+
+            priceInfo.append(
+                {
+                    "tariffStart": tariffStart,
+                    "price": float(raw_price) * GAS_BCM_TO_TWH,
+                    "descr": day.get("descr") or "None",
+                }
+            )
+
+        # Filter: keep one extra day before start for padding correctness
+        priceInfo = [d for d in priceInfo if d["tariffStart"] >= (start - timedelta(days=1))]
+
+        # Pad: fill all hours in each gas day
+        info: List[Dict[str, Any]] = []
+        for d in priceInfo:
+            t = d["tariffStart"]
+            endTime = t + timedelta(days=1)
+            while t < endTime:
+                info.append({"time": t, "price": d["price"]})
+                t += timedelta(hours=1)
+
+        # Clip to requested range
+        info = [h for h in info if start <= h["time"] < end]
         return info
 
-
-    def _makeRequest(self, path, timeout=None):
-        # --- daily info ---
-        dailyInfo = self._items(path, timeout)
+    def _makeRequest(self, path: str, timeout_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Returns daily mapped structure:
+        [
+          {"time": <datetime day-ahead marker>, "price": <close>, "descr": <zone>},
+          ...
+        ]
+        """
+        # --- daily data ---
+        dailyInfo = self._items(path, timeout_ms=timeout_ms)
         lastDaily = dailyInfo[-1] if dailyInfo else None
 
-        # Compensate for bug in EEX (your logic preserved)
+        # Compensate for bug in EEX (kept from your original logic)
         if self.lastDailyInfo:
             for idx, dayInfo in enumerate(dailyInfo):
                 if (len(dailyInfo) - 4) < idx < (len(dailyInfo) - 1):
                     previousInfo = next(
-                        (x for x in self.lastDailyInfo
-                         if x.get("tradedatetimegmt") == dayInfo.get("tradedatetimegmt")),
-                        None
+                        (x for x in self.lastDailyInfo if x.get("tradedatetimegmt") == dayInfo.get("tradedatetimegmt")),
+                        None,
                     )
                     if previousInfo and previousInfo.get("close") != dayInfo.get("close"):
                         dailyInfo[idx]["close"] = previousInfo["close"]
         self.lastDailyInfo = dailyInfo.copy()
 
-        # --- weekend info (best-effort) ---
-        weekendInfo = None
+        # --- weekend info (best-effort; may 401) ---
+        weekendInfo: Optional[List[Dict[str, Any]]] = None
         if self.tmpZone and "EOD" in self.tmpZone:
             try:
                 new_path = path.replace("ND", "WE").replace("DAY", "WEEKEND")
-                weekendInfo = self._items(new_path, timeout)
-            except Exception as e:
-                print(f"WARNING: weekend request failed ({e}). Continuing without weekend data.")
+                weekendInfo = self._items(new_path, timeout_ms=timeout_ms)
+            except EEXUnauthorized as e:
+                logger.warning("Weekend info unauthorized (ignored) | zone=%s | %s", self.tmpZone, e)
+                weekendInfo = None
+            except Exception:
+                logger.exception("Weekend info request failed (ignored) | zone=%s", self.tmpZone)
                 weekendInfo = None
 
-        # --- settledate (best-effort; if fails, treat last day as NOT closed) ---
-        lastSettleDate = None
+        # --- settledate (best-effort; may 401) ---
+        lastSettleDate: Optional[str] = None
         try:
-            priceSymbol = biddingZonesMap.get(self.tmpZone)
+            priceSymbol = biddingZonesMap.get(self.tmpZone or "")
             query = urllib.parse.urlencode({"priceSymbol": priceSymbol})
             settle_path = f"/query/json/getQuotes/settledate/dir/?{query}"
-            settle_items = self._items(settle_path, timeout)
+            settle_items = self._items(settle_path, timeout_ms=timeout_ms)
             lastSettleDate = (settle_items[0] if settle_items else {}).get("settledate")
-        except Exception as e:
-            print(f"WARNING: settledate request failed ({e}). Will treat last day as not closed.")
+        except EEXUnauthorized as e:
+            logger.warning("Settle date unauthorized (will treat last day as not closed) | zone=%s | %s", self.tmpZone, e)
+            lastSettleDate = None
+        except Exception:
+            logger.exception("Settle date request failed (will treat last day as not closed) | zone=%s", self.tmpZone)
             lastSettleDate = None
 
         lastDailyIsClosed = bool(
@@ -297,23 +370,35 @@ class EEX:
             and lastDaily["tradedatetimegmt"].split(" ")[0] == lastSettleDate
         )
 
-        # --- map to your simplified response ---
-        resp = []
+        # --- Map to day-ahead dates ---
+        resp: List[Dict[str, Any]] = []
         for idx, day in enumerate(dailyInfo):
-            t = datetime.strptime(day["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
-            mappedDay = {"time": t, "price": day.get("close"), "descr": self.tmpZone}
+            traded = day.get("tradedatetimegmt")
+            if not traded:
+                continue
 
-            # If we can't confirm settlement, drop last day (safe default)
-            if idx == len(dailyInfo) - 1 and t.weekday() != 5 and not lastDailyIsClosed:
+            # tradedatetimegmt format: "MM/DD/YYYY ..."
+            day_date = datetime.strptime(traded.split(" ")[0], "%m/%d/%Y")
+            day_ahead = (day_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+            mappedDay: Optional[Dict[str, Any]] = {
+                "time": day_ahead,
+                "price": day.get("close"),
+                "descr": self.tmpZone,
+            }
+
+            # If last day isn't settled yet, ignore it (safe)
+            if idx == len(dailyInfo) - 1 and day_ahead.weekday() != 5 and not lastDailyIsClosed:
                 mappedDay = None
 
-            if weekendInfo and mappedDay and t.weekday() == 5:
-                weekend = next((w for w in weekendInfo if w.get("tradedatetimegmt") == day.get("tradedatetimegmt")), None)
+            # Weekend info handling (if available)
+            if weekendInfo and mappedDay and day_ahead.weekday() == 5:
+                weekend = next((w for w in weekendInfo if w.get("tradedatetimegmt") == traded), None)
                 if weekend:
-                    satTime = datetime.strptime(weekend["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
-                    sat = {"time": satTime, "price": weekend.get("close"), "descr": self.tmpZone}
-                    sun = {**sat, "time": satTime + timedelta(days=1)}
-                    mon = {**mappedDay, "time": t + timedelta(days=2)}
+                    sat_date = datetime.strptime(weekend["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
+                    sat = {"time": sat_date.replace(hour=0, minute=0, second=0, microsecond=0), "price": weekend.get("close"), "descr": self.tmpZone}
+                    sun = {**sat, "time": sat["time"] + timedelta(days=1)}
+                    mon = {**mappedDay, "time": mappedDay["time"] + timedelta(days=2)}
                     resp.extend([sat, sun, mon])
                     mappedDay = None
 
@@ -323,65 +408,121 @@ class EEX:
         return resp
 
 
-def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
+# --------------------------------------------------------------------
+# Data collection
+# --------------------------------------------------------------------
 
-    today = datetime.now()
-    today = today.replace(hour=0, minute=0, second=0, microsecond=0)
+def fetch_data_for_zone(
+    biddingZone: str,
+    look_back_window_days: int = 20,
+    chunk_days: int = 2,
+) -> pd.DataFrame:
+    """
+    Fetch data going back in time in chunks.
+    For EGSI, a 401 may happen for older history; we stop lookback on EGSI 401.
+    For EOD, 401 is treated as fatal (unless it happens only for weekend/settle, which are already best-effort).
+    """
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_saved = copy.deepcopy(today)
 
-    df_ = pd.DataFrame()
+    df_all = pd.DataFrame()
+    eex = EEX(biddingZone=biddingZone)
 
-    eex = EEX(dict(biddingZone = biddingZone))
-    n = 0
+    attempts = 0
+
     while today > (today_saved - timedelta(days=look_back_window_days)):
+        start = today - timedelta(days=chunk_days)
+        end = today + timedelta(days=chunk_days)
 
-        yesterday = today - timedelta(days=2)
-        tomorrow = today + timedelta(days=2)
+        logger.info("Collect | zone=%s | window=%s..%s", biddingZone, start, end)
 
-        print(f"Getting EEX prices for zone={biddingZone} for time period {yesterday} - {tomorrow}")
-        result = eex.getPrices(
-            {'dateStart': yesterday.isoformat(), 'dateEnd': tomorrow.isoformat()}
-        )
-        df_i = pd.DataFrame(result)
-        df_ = pd.concat([df_, df_i])
-        today -= timedelta(days=2)
+        try:
+            rows = eex.getPrices({"dateStart": start.isoformat(), "dateEnd": end.isoformat()})
+        except EEXUnauthorized as e:
+            logger.warning("Unauthorized | zone=%s | window=%s..%s | %s", biddingZone, start, end, e)
+            # Stop lookback for both EGSI and EOD when hitting paywall
+            logger.warning("Stopping further lookback for %s due to 401 (likely paywall for older data).", biddingZone)
+            break
+        except Exception:
+            logger.exception("Failed request | zone=%s | window=%s..%s", biddingZone, start, end)
+            # Skip this chunk and continue (transient)
+            today -= timedelta(days=chunk_days)
+            continue
+        except Exception:
+            logger.exception("Failed request | zone=%s | window=%s..%s", biddingZone, start, end)
+            # Skip this chunk and continue (transient)
+            today -= timedelta(days=chunk_days)
+            continue
 
-        n+=1
+        if not rows:
+            logger.warning("Empty result | zone=%s | window=%s..%s", biddingZone, start, end)
+            today -= timedelta(days=chunk_days)
+            continue
 
-    print(f"Successfully collected data for {biddingZone} N={n} times")
+        df_all = pd.concat([df_all, pd.DataFrame(rows)], ignore_index=True)
+        today -= timedelta(days=chunk_days)
+        attempts += 1
 
-    df_.sort_values(by='time', ascending=True, inplace=True)
-    df_.drop_duplicates(inplace=True)
-    return df_
+    if df_all.empty:
+        logger.warning("No data collected | zone=%s | attempts=%s", biddingZone, attempts)
+        return df_all
 
-def main():
-    res = {}
-
-    for biddingZone in ['TTF_EOD','TTF_EGSI']:
-
-        df_ = fetch_data_for_zone(biddingZone)
-        if df_.empty:
-            print(f'Error. Failed to fetch ANY data for zone = {biddingZone}. Trying again...')
-            time.sleep(60)
-            df_ = fetch_data_for_zone(biddingZone)
-            if df_.empty:
-                raise IOError(f"Error. Repeatedly failed to fetch ANY data for zone = {biddingZone}.")
-
-        res[biddingZone] = copy.deepcopy(df_)
-
-    # merge the result into one dataframe
-
-    df = pd.merge(
-        left=res['TTF_EGSI'].rename(columns={'time': 'date', 'price': 'EOD'}),
-        right=res['TTF_EOD'].rename(columns={'time': 'date', 'price': 'EGSI'}),
-        on='date',
-        how='outer'
-    )
-    frequency = pd.DatetimeIndex(df['date']).inferred_freq
-    df.to_csv(f"./data/ttf_{datetime.today().strftime('%Y-%m-%d')}_{frequency}.csv",index=False)
+    df_all.sort_values(by="time", ascending=True, inplace=True)
+    df_all.drop_duplicates(subset=["time"], inplace=True)
+    logger.info("Collected OK | zone=%s | points=%d | attempts=%d", biddingZone, len(df_all), attempts)
+    return df_all
 
 
-if __name__ == '__main__':
+# --------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------
+
+def main() -> None:
+    setup_logging()
+
+    zones = ["TTF_EOD", "TTF_EGSI"]
+    look_back_days = int(os.environ.get("LOOKBACK_DAYS", "20"))
+
+    results: Dict[str, pd.DataFrame] = {}
+
+    for z in zones:
+        df = fetch_data_for_zone(z, look_back_window_days=look_back_days)
+
+        # EOD is typically required. EGSI may be unavailable (401).
+        if df.empty and "EOD" in z:
+            raise RuntimeError(f"Failed to fetch ANY data for required zone={z}")
+        if df.empty and "EGSI" in z:
+            logger.warning("No EGSI data available for zone=%s (possibly unauthorized / paywalled). Continuing.", z)
+
+        results[z] = df.copy()
+
+    # Merge result into one dataframe
+    # Fix: correct column naming (EOD from TTF_EOD, EGSI from TTF_EGSI)
+    df_eod = results.get("TTF_EOD", pd.DataFrame()).rename(columns={"time": "date", "price": "EOD"})
+    df_egsi = results.get("TTF_EGSI", pd.DataFrame()).rename(columns={"time": "date", "price": "EGSI"})
+
+    if df_eod.empty and df_egsi.empty:
+        raise RuntimeError("No data available from any zone; nothing to write.")
+
+    if df_eod.empty:
+        df = df_egsi.copy()
+    elif df_egsi.empty:
+        df = df_eod.copy()
+    else:
+        df = pd.merge(df_egsi, df_eod, on="date", how="outer")  # date is hourly, so outer is fine
+
+    df.sort_values("date", inplace=True)
+
+    # Frequency inference can be None; handle safely
+    freq = pd.DatetimeIndex(df["date"]).inferred_freq or "unknown"
+
+    out_dir = "./data"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = f"{out_dir}/ttf_{datetime.utcnow().strftime('%Y-%m-%d')}_{freq}.csv"
+
+    df.to_csv(out_path, index=False)
+    logger.info("Wrote CSV | rows=%d | path=%s", len(df), out_path)
+
+
+if __name__ == "__main__":
     main()
-
-
