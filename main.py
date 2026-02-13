@@ -8,14 +8,14 @@ import pytz
 import pandas as pd
 import copy
 import time
-
+from urllib3.util.retry import Retry
 import requests
 import urllib3
 import urllib.parse
 urllib3.disable_warnings(
     urllib3.exceptions.InsecureRequestWarning
 )
-
+from requests.adapters import HTTPAdapter
 # Each bidding zone has two variants:
 # EOD: End of Day settlement prices.
 # EGSI: European Gas Spot Index prices.
@@ -85,26 +85,72 @@ class EEX:
     and making HTTP requests.
     """
     def __init__(self, opts=None):
-        """
-        self.host: The API host to connect to.
-        self.port: The port to use for the connection.
-        self.timeout: The timeout for HTTP requests.
-        self.biddingZone: The default bidding zone for price queries.
-        self.biddingZones: A dictionary to store bidding zones (to be defined).
-        self.biddingZonesMap: A mapping from bidding zones to price symbols (to be defined).
-        self.lastResponse: Stores the last HTTP response received.
-        self.lastDailyInfo: Stores the last set of daily information retrieved.
-        :param opts:
-        """
         options = opts or {}
         self.host = options.get('host', defaultHost)
         self.port = options.get('port', defaultPort)
         self.timeout = options.get('timeout', defaultTimeout)
         self.biddingZone = options.get('biddingZone')
-        # self.biddingZones = {}  # Define your bidding zones here
-        # self.biddingZonesMap = {}  # Define your bidding zones map here
+        self.verify_ssl = options.get('verify_ssl', False)  # keep your current behavior by default
         self.lastResponse = None
         self.lastDailyInfo = None
+        self.tmpZone = None
+
+        # One session + retries (handles transient 429/5xx)
+        self.session = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def _headers(self):
+        # For GET, "Accept" matters; request "content-type" usually doesn't.
+        return {
+            "Accept": "application/json",
+            "Origin": "https://www.eex.com",
+            "Referer": "https://www.eex.com",
+            "User-Agent": "Mozilla/5.0",
+            "Connection": "keep-alive",
+        }
+    def _get_json(self, path: str, timeout_ms: int | None = None) -> dict:
+        url = f"https://{self.host}:{self.port}{path}"
+        r = self.session.get(
+            url,
+            headers=self._headers(),
+            timeout=(timeout_ms or self.timeout) / 1000,
+            verify=self.verify_ssl,
+            allow_redirects=True,
+        )
+
+        # keep something useful for debugging
+        self.lastResponse = (r.text or "")[:2000]
+
+        # status check first
+        if r.status_code != 200:
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"HTTP {r.status_code} for {r.url}. Body starts: {snippet!r}")
+
+        # content-type check (tolerate charset etc.)
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "json" not in ctype:
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"Non-JSON response for {r.url} (content-type={ctype!r}). Body starts: {snippet!r}")
+
+        try:
+            return r.json()
+        except ValueError as e:
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"Invalid JSON from {r.url}. Body starts: {snippet!r}") from e
+
+    def _items(self, path: str, timeout_ms: int | None = None) -> list[dict]:
+        payload = self._get_json(path, timeout_ms)
+        items = payload.get("results", {}).get("items")
+        if not isinstance(items, list):
+            raise RuntimeError(f"Invalid payload shape for {path}: missing results.items")
+        return items
 
     def getPrices(self, options=None):
         """
@@ -205,127 +251,76 @@ class EEX:
 
 
     def _makeRequest(self, path, timeout=None):
-        try:
-            headers = {
-                'content-type': 'application/json',
-                'Origin': 'https://www.eex.com',
-                'Referer': 'https://www.eex.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Connection': 'keep-alive',
-            }
-            url = f"https://{self.host}:{self.port}{path}"
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=(timeout or self.timeout)/1000,
-                verify=False # rejectUnauthorized: false -- Disables SSL verification to bypass any certificate issues
-            )
+        # --- daily info ---
+        dailyInfo = self._items(path, timeout)
+        lastDaily = dailyInfo[-1] if dailyInfo else None
 
-            self.lastResponse = response.text or response.status_code
-            content_type = response.headers.get('content-type')
-
-            if response.status_code != 200:
-                self.lastResponse = response.status_code
-                print(f"For url {response.url}")
-                raise Exception(f'HTTP request failed. Status Code: {response.status_code}')
-
-            if headers['content-type'] != content_type:
-                body = response.text[:20]
-                raise Exception(f"Expected {headers['content-type']} but received {content_type}: {body}")
-
-            if 'json' in content_type:
-                respJSON = response.json()
-                if not respJSON.get('results') or not respJSON['results'].get('items'):
-                    raise Exception('Invalid info')
-                dailyInfo = respJSON['results']['items']
-                lastDaily = dailyInfo[-1] if dailyInfo else None
-
-                # Compensate for bug in EEX
-                if self.lastDailyInfo:
-                    for idx, dayInfo in enumerate(dailyInfo):
-                        if (len(dailyInfo) - 4) < idx < (len(dailyInfo) - 1):
-                            previousInfo = next(
-                                (lastDayInfo for lastDayInfo in self.lastDailyInfo
-                                 if lastDayInfo['tradedatetimegmt'] == dayInfo['tradedatetimegmt']), None)
-                            if previousInfo and previousInfo['close'] != dayInfo['close']:
-                                dailyInfo[idx]['close'] = previousInfo['close']
-                self.lastDailyInfo = dailyInfo.copy()
-
-                # Fetch weekend info ONLY FOR EOD (not EGSI)
-                weekendInfo = None
-                if 'EOD' in self.tmpZone:
-                    new_path = path.replace('ND', 'WE').replace('DAY', 'WEEKEND')
-                    weekend_response = requests.get(
-                        f"https://{self.host}:{self.port}{new_path}",
-                        headers=headers,
-                        timeout=(timeout or self.timeout)/1000,
-                        verify=False
+        # Compensate for bug in EEX (your logic preserved)
+        if self.lastDailyInfo:
+            for idx, dayInfo in enumerate(dailyInfo):
+                if (len(dailyInfo) - 4) < idx < (len(dailyInfo) - 1):
+                    previousInfo = next(
+                        (x for x in self.lastDailyInfo
+                         if x.get("tradedatetimegmt") == dayInfo.get("tradedatetimegmt")),
+                        None
                     )
-                    weekendJSON = weekend_response.json()
-                    weekendInfo = weekendJSON.get('results', {}).get('items')
+                    if previousInfo and previousInfo.get("close") != dayInfo.get("close"):
+                        dailyInfo[idx]["close"] = previousInfo["close"]
+        self.lastDailyInfo = dailyInfo.copy()
 
-                # Fetch today's settle
-                priceSymbol = biddingZonesMap.get(self.tmpZone)
-                query = urllib.parse.urlencode({'priceSymbol': priceSymbol})
-                settle_path = f"/query/json/getQuotes/settledate/dir/?{query}"
-                settle_response = requests.get(
-                    f"https://{self.host}:{self.port}{settle_path}",
-                    headers=headers,
-                    timeout=(timeout or self.timeout)/1000,
-                    verify=False
-                )
-                settleJSON = settle_response.json()
-                settle_items = settleJSON.get('results', {}).get('items', [{}])
-                lastSettleDate = settle_items[0].get('settledate')
+        # --- weekend info (best-effort) ---
+        weekendInfo = None
+        if self.tmpZone and "EOD" in self.tmpZone:
+            try:
+                new_path = path.replace("ND", "WE").replace("DAY", "WEEKEND")
+                weekendInfo = self._items(new_path, timeout)
+            except Exception as e:
+                print(f"WARNING: weekend request failed ({e}). Continuing without weekend data.")
+                weekendInfo = None
 
-                # Check if lastDaily is settled (closed)
-                lastDailyIsClosed = lastDaily and lastDaily.get('tradedatetimegmt') and (
-                        lastDaily['tradedatetimegmt'].split(' ')[0] == lastSettleDate
-                )
+        # --- settledate (best-effort; if fails, treat last day as NOT closed) ---
+        lastSettleDate = None
+        try:
+            priceSymbol = biddingZonesMap.get(self.tmpZone)
+            query = urllib.parse.urlencode({"priceSymbol": priceSymbol})
+            settle_path = f"/query/json/getQuotes/settledate/dir/?{query}"
+            settle_items = self._items(settle_path, timeout)
+            lastSettleDate = (settle_items[0] if settle_items else {}).get("settledate")
+        except Exception as e:
+            print(f"WARNING: settledate request failed ({e}). Will treat last day as not closed.")
+            lastSettleDate = None
 
-                # Create array with daily values
-                resp = []
-                for idx, day in enumerate(dailyInfo):
-                    time = datetime.strptime(day['tradedatetimegmt'].split(' ')[0], '%m/%d/%Y')
-                    time += timedelta(days=1)  # Day ahead
-                    mappedDay = {
-                        'time': time,
-                        'price': day['close'],
-                        'descr': self.tmpZone,
-                    }
+        lastDailyIsClosed = bool(
+            lastDaily
+            and lastDaily.get("tradedatetimegmt")
+            and lastSettleDate
+            and lastDaily["tradedatetimegmt"].split(" ")[0] == lastSettleDate
+        )
 
-                    # Check if last daily entry is closed
-                    if (idx == len(dailyInfo) - 1 and time.weekday() != 5 and not lastDailyIsClosed):
-                        mappedDay = None  # Ignore last day info because it is not closed yet
+        # --- map to your simplified response ---
+        resp = []
+        for idx, day in enumerate(dailyInfo):
+            t = datetime.strptime(day["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
+            mappedDay = {"time": t, "price": day.get("close"), "descr": self.tmpZone}
 
-                    # Check if last entry is weekend info and is closed
-                    if weekendInfo and mappedDay and time.weekday() == 5:
-                        weekend = next(
-                            (dayW for dayW in weekendInfo if dayW['tradedatetimegmt'] == day['tradedatetimegmt']),
-                            None
-                        )
-                        satTime = datetime.strptime(weekend['tradedatetimegmt'].split(' ')[0], '%m/%d/%Y')
-                        satTime += timedelta(days=1)
-                        sat = {
-                            'time': satTime,
-                            'price': weekend['close'],
-                            'descr': self.tmpZone,
-                        }
-                        sun = sat.copy()
-                        sun['time'] += timedelta(days=1)
-                        mon = mappedDay.copy()
-                        mon['time'] += timedelta(days=2)
-                        resp.extend([sat, sun, mon])
-                        mappedDay = None  # Skip adding normal weekday info
+            # If we can't confirm settlement, drop last day (safe default)
+            if idx == len(dailyInfo) - 1 and t.weekday() != 5 and not lastDailyIsClosed:
+                mappedDay = None
 
-                    # Add normal weekday info
-                    if mappedDay:
-                        resp.append(mappedDay)
-                return resp
-            else:
-                raise Exception(f"No JSON received: {content_type}")
-        except Exception as error:
-            raise error
+            if weekendInfo and mappedDay and t.weekday() == 5:
+                weekend = next((w for w in weekendInfo if w.get("tradedatetimegmt") == day.get("tradedatetimegmt")), None)
+                if weekend:
+                    satTime = datetime.strptime(weekend["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
+                    sat = {"time": satTime, "price": weekend.get("close"), "descr": self.tmpZone}
+                    sun = {**sat, "time": satTime + timedelta(days=1)}
+                    mon = {**mappedDay, "time": t + timedelta(days=2)}
+                    resp.extend([sat, sun, mon])
+                    mappedDay = None
+
+            if mappedDay:
+                resp.append(mappedDay)
+
+        return resp
 
 
 def fetch_data_for_zone(biddingZone:str,look_back_window_days = 20):
