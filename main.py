@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import os
 import time
-import copy
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
@@ -34,37 +33,34 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Config / constants
 # --------------------------------------------------------------------
 
-DEFAULT_HOST = "webservice-eex.gvsi.com"
+# EEX migrated its market-data API from the legacy GVSI webservice
+# (webservice-eex.gvsi.com/query/json/getDaily/..., decommissioned ~May 2026)
+# to api.eex-group.com/pub/market-data/table-data. See _query_table_rows().
+DEFAULT_HOST = "api.eex-group.com"
 DEFAULT_PORT = 443
 DEFAULT_TIMEOUT_MS = 30_000
+TABLE_DATA_PATH = "/pub/market-data/table-data"
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
-biddingZonesMap: Dict[str, str] = {
-    # End of Day (EOD) Prices:
-    "TTF_EOD": '"#E.TTF_GND1"',
-    "CEGH_VTP_EOD": '"#E.CEGH_GND1"',
-    "CZ_VTP_EOD": '"#E.OTE_GSND"',
-    "ETF_EOD": '"#E.ETF_GND1"',  # fixed from ETFF typo in your original
-    "THE_EOD": '"#E.THE_GND1"',
-    "PEG_EOD": '"#E.PEG_GND1"',
-    "ZTP_EOD": '"#E.ZTP_GTND"',
-    "PVB_EOD": '"#E.PVB_GSND"',
-    "NBP_EOD": '"#E.NBP_GPND"',
-
-    # European Gas Spot Index (EGSI) Prices:
-    "TTF_EGSI": '"$E.EGSI_TTF_DAY"',
-    "CEGH_VTP_EGSI": '"$E.EGSI_CEHG_VTP_DAY"',
-    "CZ_VTP_EGSI": '"$E.EGSI_CZ_VTP"',
-    "ETF_EGSI": '"$E.EGSI_ETF_DAY"',
-    "THE_EGSI": '"$E.EGSI_THE_DAY"',
-    "PEG_EGSI": '"$E.EGSI_PEG_DAY"',
-    "ZTP_EGSI": '"$E.EGSI_ZTP_DAY"',
-    "PVB_EGSI": '"$E.EGSI_PVB_DAY"',
-    "NBP_EGSI": '"$E.EGSI_NBP_DAY"',
+# Maps the leading token of a biddingZone (e.g. "TTF" in "TTF_EOD") to the
+# "area" code expected by the table-data endpoint.
+AREA_MAP: Dict[str, str] = {
+    "TTF": "TTF",
+    "CEGH": "CEGHVTP",
+    "CZ": "CZVTP",
+    "ETF": "ETF",
+    "THE": "THE",
+    "PEG": "PEG",
+    "ZTP": "ZTP",
+    "PVB": "PVB",
+    "NBP": "NBP",
 }
 
-# Conversion factor from bcm to TWh (as in your comment)
+# Conversion factor (bcm -> TWh). NOTE: dimensionally this turns the raw EUR/MWh
+# price into a non-standard unit; it is kept ONLY so new data stays on the same
+# scale as the ~20 months of history already collected. Divide stored values by
+# this factor to recover the real EUR/MWh TTF price.
 GAS_BCM_TO_TWH = 9.7694
 
 # --------------------------------------------------------------------
@@ -157,7 +153,6 @@ class EEX:
         self.tmpZone: Optional[str] = None
 
         self.lastResponseSnippet: Optional[str] = None
-        self.lastDailyInfo: Optional[List[Dict[str, Any]]] = None
 
         self.session = requests.Session()
         retry = Retry(
@@ -176,8 +171,11 @@ class EEX:
         return {
             "Accept": "application/json",
             "Origin": "https://www.eex.com",
-            "Referer": "https://www.eex.com",
-            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.eex.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
             "Connection": "keep-alive",
         }
 
@@ -216,12 +214,102 @@ class EEX:
         except ValueError as e:
             raise EEXBadResponse(f"Invalid JSON for {url}. Body starts: {body_snippet!r}") from e
 
-    def _items(self, path: str, timeout_ms: Optional[int] = None) -> List[Dict[str, Any]]:
-        payload = self._get_json(path, timeout_ms=timeout_ms)
-        items = payload.get("results", {}).get("items")
-        if not isinstance(items, list):
-            raise EEXBadResponse(f"Malformed payload for path={path}: missing results.items")
-        return items
+    @staticmethod
+    def _area_for_zone(zone: str) -> str:
+        for key, val in AREA_MAP.items():
+            if zone.startswith(key):
+                return val
+        raise ValueError(f"Unknown biddingZone={zone}. No area mapping.")
+
+    def _query_table_rows(
+        self, zone: str, start_date: date, end_date: date, weekend: bool = False
+    ) -> List[tuple]:
+        """
+        Query the table-data endpoint for one product and return a list of
+        (delivery_date, price_or_None) tuples (newest delivery first, as served).
+        """
+        area = self._area_for_zone(zone)
+        display = {"CEGHVTP": "CEGH VTP", "CZVTP": "CZ VTP"}.get(area, area)
+        is_egsi = "EGSI" in zone
+
+        if is_egsi:
+            pricing, product = "I", "EGSI"
+            short_code = f"EEX EGSI {display} {'Weekend' if weekend else 'Day'}"
+        else:
+            pricing = "S"
+            product = "WE" if weekend else "DA"
+            short_code = f"{area}WE" if weekend else f"{area}DA"
+
+        params = {
+            "shortCode": short_code,
+            "commodity": "NATGAS",
+            "pricing": pricing,
+            "area": area,
+            "product": product,
+            "isRolling": "true",
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+        }
+        path = f"{TABLE_DATA_PATH}?{urllib.parse.urlencode(params)}"
+        logger.info("EEX request | zone=%s | weekend=%s | %s..%s | %s",
+                    zone, weekend, start_date, end_date, short_code)
+
+        payload = self._get_json(path)
+        data = payload.get("data")
+        header = payload.get("header") or []
+        if not isinstance(data, list):
+            raise EEXBadResponse(f"Malformed table-data (no 'data' array) for zone={zone}, short_code={short_code!r}")
+
+        delivery_idx = header.index("deliveryDay") if "deliveryDay" in header else 5
+        price_idx = next((header.index(c) for c in ("settlPx", "close", "lastPrice") if c in header), 4)
+
+        rows: List[tuple] = []
+        for row in data:
+            try:
+                delivery = row[delivery_idx]
+                price = row[price_idx]
+            except (IndexError, TypeError):
+                continue
+            if not delivery:
+                continue
+            try:
+                d = date.fromisoformat(str(delivery)[:10])
+            except ValueError:
+                continue
+            rows.append((d, None if price is None else float(price)))
+        return rows
+
+    def _fetch_table(self, zone: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+        """
+        Fetch one price per delivery day for ``zone`` over the window, deduped and
+        with None prices dropped. EOD day-ahead skips weekend delivery days, so for
+        EOD zones the weekend product is fetched (best-effort) to fill Saturdays.
+        Returns [{"time": <delivery-date midnight>, "price": <raw>, "descr": zone}, ...].
+        """
+        # Buffer back so weekend/holiday context and late settlements are included.
+        start_date = (start - timedelta(days=7)).date()
+        end_date = end.date()
+
+        by_day: Dict[date, float] = {}
+        # Response is newest-delivery-first; setdefault keeps the most recent settlement.
+        for d, price in self._query_table_rows(zone, start_date, end_date, weekend=False):
+            if price is not None:
+                by_day.setdefault(d, price)
+
+        if "EOD" in zone:
+            try:
+                for d, price in self._query_table_rows(zone, start_date, end_date, weekend=True):
+                    if price is not None:
+                        by_day.setdefault(d, price)
+            except EEXUnauthorized as e:
+                logger.warning("Weekend product unauthorized (ignored) | zone=%s | %s", zone, e)
+            except Exception:
+                logger.exception("Weekend product fetch failed (ignored) | zone=%s", zone)
+
+        return [
+            {"time": datetime(d.year, d.month, d.day), "price": p, "descr": zone}
+            for d, p in sorted(by_day.items())
+        ]
 
     def getPrices(self, options: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
@@ -247,62 +335,48 @@ class EEX:
 
         self.tmpZone = zone
 
-        # Start earlier to ensure weekend or delayed settlements don't cause gaps
-        start2 = start - timedelta(days=1)
-        chartstartdate = start2.date().isoformat()
-        chartstopdate = end.date().isoformat()
+        daily = self._fetch_table(zone, start, end)
+        if not daily:
+            raise EEXBadResponse(f"No gas price info found for zone={zone}")
 
-        priceSymbol = biddingZonesMap.get(zone)
-        if not priceSymbol:
-            raise ValueError(f"Unknown biddingZone={zone}. Missing priceSymbol mapping.")
-
-        query = urllib.parse.urlencode(
-            {"priceSymbol": priceSymbol, "chartstartdate": chartstartdate, "chartstopdate": chartstopdate}
-        )
-        path = f"/query/json/getDaily/close/tradedatetimegmt/?{query}"
-
-        logger.info("EEX request | zone=%s | start=%s | end=%s | path=%s", zone, start, end, path)
-
-        daily = self._makeRequest(path, timeout_ms=90_000)
-
-        if not daily or not any(d.get("time") for d in daily):
-            raise EEXBadResponse("No gas price info found in daily response")
-
-        # Build per-day records (skip None price days)
+        # One gas-day record per delivery day. Gas day = 06:00 Europe/Berlin on the
+        # delivery date to 06:00 Europe/Berlin the next day. Deriving the end from the
+        # *next* date (not a fixed +24h) makes the span 23/24/25h across DST switches,
+        # so the padded hourly grid stays continuous in UTC.
         priceInfo: List[Dict[str, Any]] = []
         for day in daily:
-            if day.get("descr") != zone:
-                continue
-
-            raw_day = day.get("time")
-            raw_price = day.get("price")
-
-            if raw_day is None:
-                continue
-
-            if raw_price is None:
-                logger.warning("No gas price (None) | zone=%s | day=%s | options=%s", zone, raw_day, opts)
-                continue
-
-            # Gas day start: 06:00 Europe/Berlin converted to UTC naive
-            tariffStart = to_utc_naive_from_berlin_gasday_start(raw_day.replace(hour=0, minute=0, second=0, microsecond=0))
-
+            day_date = day["time"].replace(hour=0, minute=0, second=0, microsecond=0)
             priceInfo.append(
                 {
-                    "tariffStart": tariffStart,
-                    "price": float(raw_price) * GAS_BCM_TO_TWH,
-                    "descr": day.get("descr") or "None",
+                    "tariffStart": to_utc_naive_from_berlin_gasday_start(day_date),
+                    "tariffEnd": to_utc_naive_from_berlin_gasday_start(day_date + timedelta(days=1)),
+                    "price": float(day["price"]) * GAS_BCM_TO_TWH,
+                    "descr": zone,
                 }
             )
 
-        # Filter: keep one extra day before start for padding correctness
+        # Keep one extra day before start for padding correctness, then order by time.
         priceInfo = [d for d in priceInfo if d["tariffStart"] >= (start - timedelta(days=1))]
+        priceInfo.sort(key=lambda d: d["tariffStart"])
 
-        # Pad: fill all hours in each gas day
+        # Carry-forward fill any missing delivery days (weekends/holidays) so the
+        # hourly grid is continuous: a gap [prev.end, next.start) is bridged with the
+        # previous day's price.
+        filled: List[Dict[str, Any]] = []
+        for i, d in enumerate(priceInfo):
+            filled.append(d)
+            if i + 1 < len(priceInfo):
+                gap_start, gap_end = d["tariffEnd"], priceInfo[i + 1]["tariffStart"]
+                if gap_end > gap_start:
+                    filled.append(
+                        {"tariffStart": gap_start, "tariffEnd": gap_end, "price": d["price"], "descr": zone}
+                    )
+
+        # Pad: fill all hours in each gas day (DST-aware: span may be 23/24/25h)
         info: List[Dict[str, Any]] = []
-        for d in priceInfo:
+        for d in filled:
             t = d["tariffStart"]
-            endTime = t + timedelta(days=1)
+            endTime = d["tariffEnd"]
             while t < endTime:
                 info.append({"time": t, "price": d["price"]})
                 t += timedelta(hours=1)
@@ -310,102 +384,6 @@ class EEX:
         # Clip to requested range
         info = [h for h in info if start <= h["time"] < end]
         return info
-
-    def _makeRequest(self, path: str, timeout_ms: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        Returns daily mapped structure:
-        [
-          {"time": <datetime day-ahead marker>, "price": <close>, "descr": <zone>},
-          ...
-        ]
-        """
-        # --- daily data ---
-        dailyInfo = self._items(path, timeout_ms=timeout_ms)
-        lastDaily = dailyInfo[-1] if dailyInfo else None
-
-        # Compensate for bug in EEX (kept from your original logic)
-        if self.lastDailyInfo:
-            for idx, dayInfo in enumerate(dailyInfo):
-                if (len(dailyInfo) - 4) < idx < (len(dailyInfo) - 1):
-                    previousInfo = next(
-                        (x for x in self.lastDailyInfo if x.get("tradedatetimegmt") == dayInfo.get("tradedatetimegmt")),
-                        None,
-                    )
-                    if previousInfo and previousInfo.get("close") != dayInfo.get("close"):
-                        dailyInfo[idx]["close"] = previousInfo["close"]
-        self.lastDailyInfo = dailyInfo.copy()
-
-        # --- weekend info (best-effort; may 401) ---
-        weekendInfo: Optional[List[Dict[str, Any]]] = None
-        if self.tmpZone and "EOD" in self.tmpZone:
-            try:
-                new_path = path.replace("ND", "WE").replace("DAY", "WEEKEND")
-                weekendInfo = self._items(new_path, timeout_ms=timeout_ms)
-            except EEXUnauthorized as e:
-                logger.warning("Weekend info unauthorized (ignored) | zone=%s | %s", self.tmpZone, e)
-                weekendInfo = None
-            except Exception:
-                logger.exception("Weekend info request failed (ignored) | zone=%s", self.tmpZone)
-                weekendInfo = None
-
-        # --- settledate (best-effort; may 401) ---
-        lastSettleDate: Optional[str] = None
-        try:
-            priceSymbol = biddingZonesMap.get(self.tmpZone or "")
-            query = urllib.parse.urlencode({"priceSymbol": priceSymbol})
-            settle_path = f"/query/json/getQuotes/settledate/dir/?{query}"
-            settle_items = self._items(settle_path, timeout_ms=timeout_ms)
-            lastSettleDate = (settle_items[0] if settle_items else {}).get("settledate")
-        except EEXUnauthorized as e:
-            logger.warning("Settle date unauthorized (will treat last day as not closed) | zone=%s | %s", self.tmpZone, e)
-            lastSettleDate = None
-        except Exception:
-            logger.exception("Settle date request failed (will treat last day as not closed) | zone=%s", self.tmpZone)
-            lastSettleDate = None
-
-        lastDailyIsClosed = bool(
-            lastDaily
-            and lastDaily.get("tradedatetimegmt")
-            and lastSettleDate
-            and lastDaily["tradedatetimegmt"].split(" ")[0] == lastSettleDate
-        )
-
-        # --- Map to day-ahead dates ---
-        resp: List[Dict[str, Any]] = []
-        for idx, day in enumerate(dailyInfo):
-            traded = day.get("tradedatetimegmt")
-            if not traded:
-                continue
-
-            # tradedatetimegmt format: "MM/DD/YYYY ..."
-            day_date = datetime.strptime(traded.split(" ")[0], "%m/%d/%Y")
-            day_ahead = (day_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-
-            mappedDay: Optional[Dict[str, Any]] = {
-                "time": day_ahead,
-                "price": day.get("close"),
-                "descr": self.tmpZone,
-            }
-
-            # If last day isn't settled yet, ignore it (safe)
-            if idx == len(dailyInfo) - 1 and day_ahead.weekday() != 5 and not lastDailyIsClosed:
-                mappedDay = None
-
-            # Weekend info handling (if available)
-            if weekendInfo and mappedDay and day_ahead.weekday() == 5:
-                weekend = next((w for w in weekendInfo if w.get("tradedatetimegmt") == traded), None)
-                if weekend:
-                    sat_date = datetime.strptime(weekend["tradedatetimegmt"].split(" ")[0], "%m/%d/%Y") + timedelta(days=1)
-                    sat = {"time": sat_date.replace(hour=0, minute=0, second=0, microsecond=0), "price": weekend.get("close"), "descr": self.tmpZone}
-                    sun = {**sat, "time": sat["time"] + timedelta(days=1)}
-                    mon = {**mappedDay, "time": mappedDay["time"] + timedelta(days=2)}
-                    resp.extend([sat, sun, mon])
-                    mappedDay = None
-
-            if mappedDay:
-                resp.append(mappedDay)
-
-        return resp
 
 
 # --------------------------------------------------------------------
@@ -416,61 +394,45 @@ def fetch_data_for_zone(
     biddingZone: str,
     look_back_window_days: int = 20,
     chunk_days: int = 2,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, Optional[str]]:
     """
     Fetch data going back in time in chunks.
     For EGSI, a 401 may happen for older history; we stop lookback on EGSI 401.
     For EOD, 401 is treated as fatal (unless it happens only for weekend/settle, which are already best-effort).
+
+    Returns (dataframe, last_error). ``last_error`` is a short string describing the
+    most recent failure (or None), so callers can surface *why* collection came back empty.
     """
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_saved = copy.deepcopy(today)
 
-    df_all = pd.DataFrame()
+    # The table-data endpoint returns the whole window in a single response (it
+    # serves ~45 days of rolling history), so we fetch in one request per zone
+    # rather than many small chunks. That avoids the 429 rate limiting the old
+    # chunked approach triggered, and is dramatically faster.
+    start = today - timedelta(days=look_back_window_days)
+    end = today + timedelta(days=chunk_days)  # small future buffer for the day-ahead
+
     eex = EEX(biddingZone=biddingZone)
+    logger.info("Collect | zone=%s | window=%s..%s", biddingZone, start, end)
 
-    attempts = 0
+    try:
+        rows = eex.getPrices({"dateStart": start.isoformat(), "dateEnd": end.isoformat()})
+    except EEXUnauthorized as e:
+        logger.warning("Unauthorized | zone=%s | %s", biddingZone, e)
+        return pd.DataFrame(), f"401 Unauthorized: {e}"
+    except Exception as e:
+        logger.exception("Failed request | zone=%s | window=%s..%s", biddingZone, start, end)
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
 
-    while today > (today_saved - timedelta(days=look_back_window_days)):
-        start = today - timedelta(days=chunk_days)
-        end = today + timedelta(days=chunk_days)
+    if not rows:
+        logger.warning("Empty result | zone=%s | window=%s..%s", biddingZone, start, end)
+        return pd.DataFrame(), "empty response"
 
-        logger.info("Collect | zone=%s | window=%s..%s", biddingZone, start, end)
-
-        try:
-            rows = eex.getPrices({"dateStart": start.isoformat(), "dateEnd": end.isoformat()})
-        except EEXUnauthorized as e:
-            logger.warning("Unauthorized | zone=%s | window=%s..%s | %s", biddingZone, start, end, e)
-            # Stop lookback for both EGSI and EOD when hitting paywall
-            logger.warning("Stopping further lookback for %s due to 401 (likely paywall for older data).", biddingZone)
-            break
-        except Exception:
-            logger.exception("Failed request | zone=%s | window=%s..%s", biddingZone, start, end)
-            # Skip this chunk and continue (transient)
-            today -= timedelta(days=chunk_days)
-            continue
-        except Exception:
-            logger.exception("Failed request | zone=%s | window=%s..%s", biddingZone, start, end)
-            # Skip this chunk and continue (transient)
-            today -= timedelta(days=chunk_days)
-            continue
-
-        if not rows:
-            logger.warning("Empty result | zone=%s | window=%s..%s", biddingZone, start, end)
-            today -= timedelta(days=chunk_days)
-            continue
-
-        df_all = pd.concat([df_all, pd.DataFrame(rows)], ignore_index=True)
-        today -= timedelta(days=chunk_days)
-        attempts += 1
-
-    if df_all.empty:
-        logger.warning("No data collected | zone=%s | attempts=%s", biddingZone, attempts)
-        return df_all
-
+    df_all = pd.DataFrame(rows)
     df_all.sort_values(by="time", ascending=True, inplace=True)
     df_all.drop_duplicates(subset=["time"], inplace=True)
-    logger.info("Collected OK | zone=%s | points=%d | attempts=%d", biddingZone, len(df_all), attempts)
-    return df_all
+    logger.info("Collected OK | zone=%s | points=%d", biddingZone, len(df_all))
+    return df_all, None
 
 
 # --------------------------------------------------------------------
@@ -483,16 +445,24 @@ def main() -> None:
     zones = ["TTF_EOD", "TTF_EGSI"]
     look_back_days = int(os.environ.get("LOOKBACK_DAYS", "20"))
 
+    logger.info("Start | zones=%s | lookback_days=%d | endpoint=https://%s:%d",
+                zones, look_back_days, DEFAULT_HOST, DEFAULT_PORT)
+
     results: Dict[str, pd.DataFrame] = {}
 
     for z in zones:
-        df = fetch_data_for_zone(z, look_back_window_days=look_back_days)
+        df, last_error = fetch_data_for_zone(z, look_back_window_days=look_back_days)
 
         # EOD is typically required. EGSI may be unavailable (401).
         if df.empty and "EOD" in z:
-            raise RuntimeError(f"Failed to fetch ANY data for required zone={z}")
+            raise RuntimeError(
+                f"Failed to fetch ANY data for required zone={z}. "
+                f"Last underlying error: {last_error or 'none (empty response)'}. "
+                f"Endpoint: https://{DEFAULT_HOST}:{DEFAULT_PORT} — "
+                f"check whether EEX changed/paywalled the API or is blocking the runner IP."
+            )
         if df.empty and "EGSI" in z:
-            logger.warning("No EGSI data available for zone=%s (possibly unauthorized / paywalled). Continuing.", z)
+            logger.warning("No EGSI data available for zone=%s (last_error=%s). Continuing.", z, last_error)
 
         results[z] = df.copy()
 
